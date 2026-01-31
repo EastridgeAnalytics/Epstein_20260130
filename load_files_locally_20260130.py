@@ -53,6 +53,19 @@ def click_age_yes_if_present(page):
     except PlaywrightTimeoutError:
         pass
 
+def click_next(page) -> bool:
+    """Click the paginator 'Next' link if present. Returns True if navigated."""
+    next_link = page.locator("li.pager__item--next a:has-text('Next'), a[rel='next']").first
+    if next_link.count() == 0:
+        return False
+    try:
+        with page.expect_navigation(wait_until="networkidle", timeout=45000):
+            next_link.click()
+        return True
+    except PlaywrightTimeoutError:
+        page.wait_for_timeout(1000)
+        return True
+
 def main():
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -61,24 +74,26 @@ def main():
 
         all_pdf_urls: set[str] = set()
 
-        for start_url in DATASET_PAGES:
-            print(f"\n[*] Visiting dataset: {start_url}")
-            page.goto(start_url, wait_until="networkidle", timeout=60000)
-
-            # Age gate
+        for base_url in DATASET_PAGES:
+            print(f"\n[*] Dataset: {base_url}")
+            try:
+                response = page.goto(base_url, wait_until="networkidle", timeout=60000)
+            except PlaywrightTimeoutError:
+                print(f"   - {base_url} -> timeout, skipping")
+                continue
+            if not response or not response.ok:
+                status = response.status if response else "fail"
+                print(f"   - {base_url} -> invalid (status {status}), skipping")
+                continue
             click_age_yes_if_present(page)
-
-            # Walk pagination
-            seen_page_urls = set()
+            seen_urls = set()
             while True:
-                if page.url in seen_page_urls:
+                if page.url in seen_urls:
                     break
-                seen_page_urls.add(page.url)
-
+                seen_urls.add(page.url)
                 pdfs = collect_pdfs_from_current_page(page)
                 print(f"   - {page.url} -> {len(pdfs)} pdf links")
                 all_pdf_urls |= pdfs
-
                 if not click_next(page):
                     break
 
