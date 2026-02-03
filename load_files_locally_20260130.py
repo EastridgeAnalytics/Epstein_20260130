@@ -1,5 +1,4 @@
 import os
-import re
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -11,7 +10,9 @@ DATASET_PAGES = [
     "https://www.justice.gov/epstein/doj-disclosures/data-set-11-files",
 ]
 
+MAX_PAGE = 1000  # Test ?page=1 through ?page=1000 for each dataset
 OUT_DIR = Path("doj_epstein_datasets_9_10_11_pdfs")
+VALID_URLS_OUTPUT = Path("valid_page_urls.txt")  # Final list of valid URLs
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 def url_filename(u: str) -> str:
@@ -53,49 +54,70 @@ def click_age_yes_if_present(page):
     except PlaywrightTimeoutError:
         pass
 
-def click_next(page) -> bool:
-    """Click the paginator 'Next' link if present. Returns True if navigated."""
-    next_link = page.locator("li.pager__item--next a:has-text('Next'), a[rel='next']").first
-    if next_link.count() == 0:
-        return False
-    try:
-        with page.expect_navigation(wait_until="networkidle", timeout=45000):
-            next_link.click()
-        return True
-    except PlaywrightTimeoutError:
-        page.wait_for_timeout(1000)
-        return True
-
 def main():
+    # Step 2: If valid_page_urls.txt exists, use it and only do PDF collection/download (no URL discovery).
+    if VALID_URLS_OUTPUT.exists():
+        valid_page_urls = [u.strip() for u in VALID_URLS_OUTPUT.read_text(encoding="utf-8").splitlines() if u.strip()]
+        print(f"[*] Using {len(valid_page_urls)} valid page URLs from {VALID_URLS_OUTPUT}")
+    else:
+        valid_page_urls = []
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context()
         page = context.new_page()
 
-        all_pdf_urls: set[str] = set()
+        if not valid_page_urls:
+            # Phase 1: Discover valid URLs (?page=1..MAX_PAGE per dataset), then continue to Phase 2.
+            for base_url in DATASET_PAGES:
+                print(f"\n[*] Testing URLs for: {base_url}")
+                try:
+                    response = page.goto(base_url, wait_until="networkidle", timeout=60000)
+                except PlaywrightTimeoutError:
+                    print("   - Base URL timeout, skipping dataset")
+                    continue
+                if not response or not response.ok:
+                    status = response.status if response else "fail"
+                    print(f"   - Base URL invalid (status {status}), skipping dataset")
+                    continue
+                click_age_yes_if_present(page)
 
-        for base_url in DATASET_PAGES:
-            print(f"\n[*] Dataset: {base_url}")
+                for page_num in range(1, MAX_PAGE + 1):
+                    url = f"{base_url}?page={page_num}"
+                    try:
+                        response = page.goto(url, wait_until="networkidle", timeout=60000)
+                    except PlaywrightTimeoutError:
+                        print(f"   - {url} -> timeout (stopping this dataset)")
+                        break
+                    if not response or not response.ok:
+                        status = response.status if response else "fail"
+                        print(f"   - {url} -> invalid (status {status}), stopping at page {page_num - 1}")
+                        break
+                    valid_page_urls.append(url)
+                    if page_num <= 5 or page_num % 50 == 0 or page_num == MAX_PAGE:
+                        print(f"   - valid: {url}")
+
+            valid_page_urls.sort()
+            VALID_URLS_OUTPUT.write_text("\n".join(valid_page_urls), encoding="utf-8")
+            print(f"\n[*] Total valid page URLs: {len(valid_page_urls)}")
+            print(f"[Saved] Valid URLs written to: {VALID_URLS_OUTPUT.resolve()}")
+
+        if not valid_page_urls:
+            print("No valid page URLs found.")
+            browser.close()
+            return
+
+        # Phase 2: Collect PDFs from each valid page URL, then download.
+        all_pdf_urls: set[str] = set()
+        for url in valid_page_urls:
             try:
-                response = page.goto(base_url, wait_until="networkidle", timeout=60000)
+                response = page.goto(url, wait_until="networkidle", timeout=60000)
             except PlaywrightTimeoutError:
-                print(f"   - {base_url} -> timeout, skipping")
                 continue
             if not response or not response.ok:
-                status = response.status if response else "fail"
-                print(f"   - {base_url} -> invalid (status {status}), skipping")
                 continue
-            click_age_yes_if_present(page)
-            seen_urls = set()
-            while True:
-                if page.url in seen_urls:
-                    break
-                seen_urls.add(page.url)
-                pdfs = collect_pdfs_from_current_page(page)
-                print(f"   - {page.url} -> {len(pdfs)} pdf links")
-                all_pdf_urls |= pdfs
-                if not click_next(page):
-                    break
+            pdfs = collect_pdfs_from_current_page(page)
+            all_pdf_urls |= pdfs
 
         print(f"\n[*] Total unique PDFs found: {len(all_pdf_urls)}")
         if not all_pdf_urls:
